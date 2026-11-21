@@ -1,16 +1,18 @@
 mod abi;
 mod download;
+mod inject;
 mod symbols;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().nth(1).as_deref() != Some("inspect") {
-        eprintln!("Usage: undowhat inspect");
-        return Ok(());
+    match std::env::args().nth(1).as_deref() {
+        Some("inspect") => {
+            for (name, rva) in symbols::resolve()?.entries() {
+                println!("{name}: {rva:#x}");
+            }
+        }
+        Some("stop") => inject::run(None)?,
+        Some("start") | None => inject::run(Some(&symbols::resolve()?))?,
+        _ => eprintln!("Usage: undowhat [start|stop|inspect]"),
     }
-
-    for (name, rva) in symbols::resolve()?.entries() {
-        println!("{name}: {rva:#x}");
-    }
-
     Ok(())
 }
