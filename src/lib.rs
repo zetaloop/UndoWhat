@@ -31,10 +31,11 @@ static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static ORIGINAL_DO: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_UNDO: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_REDO: AtomicUsize = AtomicUsize::new(0);
+static ORIGINAL_PROPERTY: AtomicUsize = AtomicUsize::new(0);
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
 thread_local! {
-    static OPERATION: RefCell<Option<Vec<Record>>> = const { RefCell::new(None) };
+    static OPERATION: RefCell<Option<(bool, Vec<Record>)>> = const { RefCell::new(None) };
 }
 
 struct Runtime {
@@ -66,12 +67,12 @@ unsafe extern "system" fn redo(manager: *mut c_void, unit: *mut c_void) -> i32 {
 
 unsafe fn run(target: &AtomicUsize, action: &str, manager: *mut c_void, unit: *mut c_void) -> i32 {
     let original: Do = unsafe { mem::transmute(target.load(Ordering::Acquire)) };
-    let previous = OPERATION.with(|state| state.replace(Some(Vec::new())));
+    let previous = OPERATION.with(|state| state.replace(Some((action == "重做", Vec::new()))));
     let result = unsafe { original(manager, unit) };
     let records = OPERATION.with(|state| state.replace(previous));
 
     if result >= 0
-        && let Some(records) = records
+        && let Some((_, records)) = records
     {
         let mut records = records.into_iter();
         if let Some(mut first) = records.next() {
@@ -98,10 +99,10 @@ unsafe fn run(target: &AtomicUsize, action: &str, manager: *mut c_void, unit: *m
 
 unsafe extern "system" fn file_do(unit: *mut c_void, manager: *mut c_void) -> i32 {
     let original: Do = unsafe { mem::transmute(ORIGINAL_DO.load(Ordering::Acquire)) };
-    let record = if OPERATION.with(|state| state.borrow().is_some()) {
+    let record = if let Some(redo) = OPERATION.with(|state| state.borrow().as_ref().map(|s| s.0)) {
         FUNCTIONS
             .get()
-            .and_then(|functions| unsafe { functions.snapshot(unit) })
+            .and_then(|functions| unsafe { functions.snapshot(unit, redo) })
     } else {
         None
     };
@@ -110,12 +111,48 @@ unsafe extern "system" fn file_do(unit: *mut c_void, manager: *mut c_void) -> i3
         && let Some(record) = record
     {
         OPERATION.with(|state| {
-            if let Some(records) = state.borrow_mut().as_mut() {
+            if let Some((_, records)) = state.borrow_mut().as_mut() {
                 records.push(record);
             }
         });
     }
     result
+}
+
+type Property = unsafe extern "system" fn(
+    *mut c_void,
+    *mut c_void,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    i32,
+) -> i32;
+
+unsafe extern "system" fn property(
+    unit: *mut c_void,
+    item: *mut c_void,
+    key: *const c_void,
+    first: *const c_void,
+    second: *const c_void,
+    inverse: i32,
+) -> i32 {
+    let original: Property = unsafe { mem::transmute(ORIGINAL_PROPERTY.load(Ordering::Acquire)) };
+    let hr = unsafe { original(unit, item, key, first, second, inverse) };
+    if hr >= 0 && OPERATION.with(|state| state.borrow().is_some()) {
+        // Do builds the opposite unit: its target value is this operation's starting value.
+        let (from, to) = if inverse != 0 {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let record = unsafe { capture::property(item, key, from, to) };
+        OPERATION.with(|state| {
+            if let Some((_, records)) = state.borrow_mut().as_mut() {
+                records.push(record);
+            }
+        });
+    }
+    hr
 }
 
 fn start(symbols: Symbols) -> u32 {
@@ -143,6 +180,9 @@ fn start(symbols: Symbols) -> u32 {
         let redo_target = (shell + symbols.redo_to) as *mut c_void;
         let original = unsafe { MinHook::create_hook(redo_target, redo as *mut c_void) }?;
         ORIGINAL_REDO.store(original as usize, Ordering::Release);
+        let target = (storage + symbols.property_info) as *mut c_void;
+        let original = unsafe { MinHook::create_hook(target, property as *mut c_void) }?;
+        ORIGINAL_PROPERTY.store(original as usize, Ordering::Release);
         Ok::<_, minhook::MH_STATUS>(())
     })();
     if install.is_err() {
