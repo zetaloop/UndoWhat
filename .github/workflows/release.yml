@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Resolve version
+        id: version
+        run: |
+          $version = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $tag = "v$version"
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_NAME -ne $tag) {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Check
+        run: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Package
+        run: Compress-Archive -Path target/release/undowhat.dll -DestinationPath target/release/undowhat-x64.zip
+
+      - name: Create release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create $env:TAG target/release/undowhat-x64.zip --draft --target $env:GITHUB_SHA --title $env:TAG --generate-notes
