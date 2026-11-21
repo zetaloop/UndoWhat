@@ -1,25 +1,36 @@
-mod abi;
 mod capture;
+mod download;
 mod notify;
+mod symbols;
 
 use std::{
     cell::RefCell,
     ffi::c_void,
-    mem,
+    io, mem, ptr,
     sync::{
-        Mutex, OnceLock,
+        OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
-    thread::{self, JoinHandle},
 };
 
 use minhook::MinHook;
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HMODULE},
+    System::{
+        Diagnostics::Debug::OutputDebugStringW,
+        LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+            GetModuleHandleExW, GetModuleHandleW, LoadLibraryW,
+        },
+        SystemServices::DLL_PROCESS_ATTACH,
+        Threading::CreateThread,
+    },
+};
 
 use crate::{
-    abi::Symbols,
     capture::{Functions, Record},
+    symbols::{Preparation, Symbols},
 };
 
 type Do = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
@@ -29,15 +40,10 @@ static ORIGINAL_DO: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_UNDO: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_REDO: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_PROPERTY: AtomicUsize = AtomicUsize::new(0);
-static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
+static RECORDS: OnceLock<mpsc::Sender<Record>> = OnceLock::new();
 
 thread_local! {
     static OPERATION: RefCell<Option<(bool, Vec<Record>)>> = const { RefCell::new(None) };
-}
-
-struct Runtime {
-    sender: mpsc::Sender<Record>,
-    notifier: JoinHandle<()>,
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -84,10 +90,8 @@ unsafe fn run(target: &AtomicUsize, action: &str, manager: *mut c_void, unit: *m
             if first.count > 1 {
                 first.description.push_str(&format!(" {} 项", first.count));
             }
-            if let Ok(runtime) = RUNTIME.lock()
-                && let Some(runtime) = runtime.as_ref()
-            {
-                let _ = runtime.sender.send(first);
+            if let Some(sender) = RECORDS.get() {
+                let _ = sender.send(first);
             }
         }
     }
@@ -152,20 +156,13 @@ unsafe extern "system" fn property(
     hr
 }
 
-fn start(symbols: Symbols) -> u32 {
-    let Ok(mut runtime) = RUNTIME.lock() else {
-        return 1;
-    };
-    if runtime.is_some() {
-        return 0;
-    }
-
+fn install(symbols: Symbols) -> io::Result<mpsc::Receiver<Record>> {
     let storage = module("Windows.Storage.dll");
     let shell = module("shell32.dll");
     if storage == 0 || shell == 0 {
-        return 2;
+        return Err(io::Error::last_os_error());
     }
-    let _ = FUNCTIONS.set(unsafe { Functions::new(storage, symbols) });
+    let _ = FUNCTIONS.set(unsafe { Functions::new(storage, &symbols) });
 
     let file_target = (storage + symbols.file_do) as *mut c_void;
     let undo_target = (shell + symbols.undo_to) as *mut c_void;
@@ -182,61 +179,84 @@ fn start(symbols: Symbols) -> u32 {
         ORIGINAL_PROPERTY.store(original as usize, Ordering::Release);
         Ok::<_, minhook::MH_STATUS>(())
     })();
-    if install.is_err() {
+    if let Err(error) = install {
         MinHook::uninitialize();
-        return 4;
+        return Err(io::Error::other(format!("MinHook: {error:?}")));
     }
 
     let (sender, receiver) = mpsc::channel::<Record>();
-    let notifier = thread::spawn(move || {
-        notify::with_apartment(|| {
-            for record in receiver {
-                let _ = notify::show(&record.description, &record.lines.join("\n"));
-            }
-        })
-    });
-    *runtime = Some(Runtime { sender, notifier });
-
-    if unsafe { MinHook::enable_all_hooks() }.is_err() {
-        let running = runtime.take();
-        drop(runtime);
-        if let Some(running) = running {
-            drop(running.sender);
-            let _ = running.notifier.join();
-        }
+    let _ = RECORDS.set(sender);
+    if let Err(error) = unsafe { MinHook::enable_all_hooks() } {
         MinHook::uninitialize();
-        return 5;
+        return Err(io::Error::other(format!("MinHook: {error:?}")));
     }
+    Ok(receiver)
+}
+
+unsafe extern "system" fn initialize(_: *mut c_void) -> u32 {
+    notify::with_apartment(|| {
+        let mut phase = Preparation::Cached;
+        let result = symbols::resolve(&mut phase).and_then(|symbols| {
+            if matches!(phase, Preparation::Resolve) {
+                phase = Preparation::Activate;
+            }
+            install(symbols)
+        });
+        let notice = match (&phase, &result) {
+            (Preparation::Cached, _) => None,
+            (_, Ok(_)) => Some(("UndoWhat 已就绪", String::new())),
+            (Preparation::Download(file), Err(e)) => {
+                Some(("UndoWhat 符号下载失败", format!("{file}\n{e}")))
+            }
+            (Preparation::Resolve, Err(e)) => Some(("UndoWhat 符号解析失败", e.to_string())),
+            (Preparation::Activate, Err(e)) => Some(("UndoWhat 启动失败", e.to_string())),
+        };
+        if let Some((title, body)) = notice {
+            let _ = notify::show(title, &body);
+        }
+        match result {
+            Ok(receiver) => {
+                for record in receiver {
+                    let _ = notify::show(&record.description, &record.lines.join("\n"));
+                }
+            }
+            Err(error) => unsafe {
+                OutputDebugStringW(wide(&format!("UndoWhat: {error}")).as_ptr())
+            },
+        }
+    });
     0
 }
 
-/// # Safety
-/// The caller must pass a valid pointer to a Symbols value in the current process.
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn UndoWhatStart(symbols: *const Symbols) -> u32 {
-    if symbols.is_null() {
-        return 87;
+unsafe extern "system" fn DllMain(module: HMODULE, reason: u32, _: *mut c_void) -> i32 {
+    if reason == DLL_PROCESS_ATTACH {
+        // The worker and active hooks live until the host process exits.
+        let mut pinned = ptr::null_mut();
+        if unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                module.cast(),
+                &mut pinned,
+            )
+        } == 0
+        {
+            return 0;
+        }
+        let worker = unsafe {
+            CreateThread(
+                ptr::null(),
+                0,
+                Some(initialize),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if worker.is_null() {
+            return 0;
+        }
+        unsafe { CloseHandle(worker) };
     }
-    start(unsafe { *symbols })
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn UndoWhatStop(_: *mut c_void) -> u32 {
-    let Ok(mut runtime) = RUNTIME.lock() else {
-        return 1;
-    };
-    if runtime.is_none() {
-        return 0;
-    }
-    if unsafe { MinHook::disable_all_hooks() }.is_err() {
-        return 2;
-    }
-    let running = runtime.take();
-    drop(runtime);
-    if let Some(running) = running {
-        drop(running.sender);
-        let _ = running.notifier.join();
-    }
-    MinHook::uninitialize();
-    0
+    1
 }

@@ -18,7 +18,7 @@ use windows::{
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 
-use crate::abi::Symbols;
+use crate::symbols::Symbols;
 
 pub struct Record {
     pub description: String,
@@ -40,7 +40,7 @@ pub struct Functions {
 }
 
 impl Functions {
-    pub unsafe fn new(base: usize, symbols: Symbols) -> Self {
+    pub unsafe fn new(base: usize, symbols: &Symbols) -> Self {
         Self {
             op: unsafe { mem::transmute::<usize, GetOp>(base + symbols.root_op) },
             source: unsafe { mem::transmute::<usize, Item>(base + symbols.root_source) },

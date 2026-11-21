@@ -1,4 +1,4 @@
-use crate::{abi::Symbols, download};
+use crate::download;
 
 use std::{env, ffi::c_void, fs, io, path::PathBuf, ptr};
 
@@ -19,24 +19,16 @@ const NAMES: [(&str, &str); 9] = [
     ("shell32", "CUndoManager::RedoTo"),
 ];
 
-impl Symbols {
-    pub fn entries(&self) -> impl Iterator<Item = (String, usize)> {
-        let values = [
-            self.file_do,
-            self.root_source,
-            self.root_destination,
-            self.root_op,
-            self.src_parent,
-            self.dst_parent,
-            self.property_info,
-            self.undo_to,
-            self.redo_to,
-        ];
-        NAMES
-            .into_iter()
-            .zip(values)
-            .map(|((module, name), rva)| (format!("{module}!{name}"), rva))
-    }
+pub struct Symbols {
+    pub file_do: usize,
+    pub root_source: usize,
+    pub root_destination: usize,
+    pub root_op: usize,
+    pub src_parent: usize,
+    pub dst_parent: usize,
+    pub property_info: usize,
+    pub undo_to: usize,
+    pub redo_to: usize,
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -67,7 +59,6 @@ pub fn resolve(preparation: &mut Preparation) -> io::Result<Symbols> {
         .unwrap_or_else(env::temp_dir)
         .join("UndoWhat")
         .join("symbols");
-    fs::create_dir_all(&cache)?;
     let system = env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("C:/Windows"))
@@ -75,6 +66,15 @@ pub fn resolve(preparation: &mut Preparation) -> io::Result<Symbols> {
     let path = if let Ok(path) = env::var("_NT_SYMBOL_PATH") {
         path
     } else {
+        fs::create_dir_all(&cache)?;
+        // Explorer processes share the same PDB downloads.
+        let lock = fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cache.join(".lock"))?;
+        lock.lock()?;
         let mut paths = Vec::new();
         for module in ["Windows.Storage", "shell32"] {
             let folder =
