@@ -2,6 +2,7 @@ mod capture;
 mod download;
 mod notify;
 mod symbols;
+mod verifier;
 
 use std::{
     cell::RefCell,
@@ -229,7 +230,10 @@ unsafe extern "system" fn initialize(_: *mut c_void) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "system" fn DllMain(module: HMODULE, reason: u32, _: *mut c_void) -> i32 {
+unsafe extern "system" fn DllMain(module: HMODULE, reason: u32, reserved: *mut c_void) -> i32 {
+    if reason == verifier::DLL_PROCESS_VERIFIER {
+        return unsafe { verifier::describe(reserved) };
+    }
     if reason == DLL_PROCESS_ATTACH {
         // The worker and active hooks live until the host process exits.
         let mut pinned = ptr::null_mut();
