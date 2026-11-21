@@ -2,20 +2,17 @@ use std::{ffi::c_void, mem, ptr};
 
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 
-#[link(name = "oleaut32")]
-unsafe extern "system" {
-    fn SysFreeString(bstr: *mut u16);
-}
-
 use crate::{abi::Symbols, notify::Record};
 
 type Item = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32;
+type GetOp = unsafe extern "system" fn(*mut c_void, bool, *mut u32) -> i32;
 type ChildCount = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
 type Child = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
 type ShellItem = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
 
 #[derive(Clone, Copy)]
 pub struct Functions {
+    op: GetOp,
     source: Item,
     destination: Item,
     count: ChildCount,
@@ -26,6 +23,7 @@ pub struct Functions {
 impl Functions {
     pub unsafe fn new(base: usize, symbols: Symbols) -> Self {
         Self {
+            op: unsafe { mem::transmute::<usize, GetOp>(base + symbols.root_op) },
             source: unsafe { mem::transmute::<usize, Item>(base + symbols.root_source) },
             destination: unsafe { mem::transmute::<usize, Item>(base + symbols.root_destination) },
             count: unsafe { mem::transmute::<usize, ChildCount>(base + symbols.node_count) },
@@ -38,19 +36,6 @@ impl Functions {
         if unit.is_null() {
             return None;
         }
-
-        let vtable = unsafe { *(unit as *const *const usize) };
-        type GetDescription = unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> i32;
-        let describe: GetDescription = unsafe { mem::transmute(*vtable.add(4)) };
-        let mut description_ptr: *mut u16 = ptr::null_mut();
-        let description =
-            if unsafe { describe(unit, &mut description_ptr) } >= 0 && !description_ptr.is_null() {
-                let value = unsafe { utf16(description_ptr) };
-                unsafe { SysFreeString(description_ptr) };
-                value
-            } else {
-                "撤销文件操作".to_owned()
-            };
 
         let dpa = unsafe { *((unit as *const u8).add(0x20) as *const *const u8) };
         if dpa.is_null() {
@@ -65,11 +50,20 @@ impl Functions {
             return None;
         }
         let mut lines = Vec::new();
+        let mut kind = None;
         for index in 0..count as usize {
             let root = unsafe { *roots.add(index) };
             if root.is_null() {
                 continue;
             }
+            let mut op = 0;
+            if unsafe { (self.op)(root, false, &mut op) } < 0 {
+                op = 0;
+            }
+            kind = Some(match kind {
+                Some(previous) if previous != op => 0,
+                _ => op,
+            });
             let source = unsafe { get_item(self.source, root) };
             let destination = unsafe { get_item(self.destination, root) };
             match (source.as_deref(), destination.as_deref()) {
@@ -82,7 +76,22 @@ impl Functions {
             // CUndoRoot's IOperationNode interface is at +0x10.
             unsafe { self.children(root.byte_add(0x10), &mut lines) };
         }
-        Some(Record { description, lines })
+        let description = match kind? {
+            1 => "移动",
+            2 => "复制",
+            3 => "删除",
+            4 => "重命名",
+            5 => "创建链接",
+            6 => "属性更改",
+            7 => "新建",
+            8 => "删除云文件",
+            _ => "文件操作",
+        };
+        Some(Record {
+            description: description.to_owned(),
+            count: count as usize,
+            lines,
+        })
     }
 
     unsafe fn children(&self, parent: *mut c_void, lines: &mut Vec<String>) {

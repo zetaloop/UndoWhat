@@ -6,6 +6,7 @@ use windows::{
 
 pub struct Record {
     pub description: String,
+    pub count: usize,
     pub lines: Vec<String>,
 }
 

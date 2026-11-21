@@ -30,10 +30,11 @@ type Do = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static ORIGINAL_DO: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_UNDO: AtomicUsize = AtomicUsize::new(0);
+static ORIGINAL_REDO: AtomicUsize = AtomicUsize::new(0);
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
 thread_local! {
-    static UNDO: RefCell<Option<Vec<Record>>> = const { RefCell::new(None) };
+    static OPERATION: RefCell<Option<Vec<Record>>> = const { RefCell::new(None) };
 }
 
 struct Runtime {
@@ -56,10 +57,18 @@ fn module(name: &str) -> usize {
 }
 
 unsafe extern "system" fn undo(manager: *mut c_void, unit: *mut c_void) -> i32 {
-    let original: Do = unsafe { mem::transmute(ORIGINAL_UNDO.load(Ordering::Acquire)) };
-    let previous = UNDO.with(|state| state.replace(Some(Vec::new())));
+    unsafe { run(&ORIGINAL_UNDO, "撤销", manager, unit) }
+}
+
+unsafe extern "system" fn redo(manager: *mut c_void, unit: *mut c_void) -> i32 {
+    unsafe { run(&ORIGINAL_REDO, "重做", manager, unit) }
+}
+
+unsafe fn run(target: &AtomicUsize, action: &str, manager: *mut c_void, unit: *mut c_void) -> i32 {
+    let original: Do = unsafe { mem::transmute(target.load(Ordering::Acquire)) };
+    let previous = OPERATION.with(|state| state.replace(Some(Vec::new())));
     let result = unsafe { original(manager, unit) };
-    let records = UNDO.with(|state| state.replace(previous));
+    let records = OPERATION.with(|state| state.replace(previous));
 
     if result >= 0
         && let Some(records) = records
@@ -68,9 +77,14 @@ unsafe extern "system" fn undo(manager: *mut c_void, unit: *mut c_void) -> i32 {
         if let Some(mut first) = records.next() {
             for record in records {
                 if record.description != first.description {
-                    first.lines.push(record.description);
+                    first.description = "文件操作".to_owned();
                 }
+                first.count += record.count;
                 first.lines.extend(record.lines);
+            }
+            first.description.insert_str(0, action);
+            if first.count > 1 {
+                first.description.push_str(&format!(" {} 项", first.count));
             }
             if let Ok(runtime) = RUNTIME.lock()
                 && let Some(runtime) = runtime.as_ref()
@@ -84,7 +98,7 @@ unsafe extern "system" fn undo(manager: *mut c_void, unit: *mut c_void) -> i32 {
 
 unsafe extern "system" fn file_do(unit: *mut c_void, manager: *mut c_void) -> i32 {
     let original: Do = unsafe { mem::transmute(ORIGINAL_DO.load(Ordering::Acquire)) };
-    let record = if UNDO.with(|state| state.borrow().is_some()) {
+    let record = if OPERATION.with(|state| state.borrow().is_some()) {
         FUNCTIONS
             .get()
             .and_then(|functions| unsafe { functions.snapshot(unit) })
@@ -95,7 +109,7 @@ unsafe extern "system" fn file_do(unit: *mut c_void, manager: *mut c_void) -> i3
     if result >= 0
         && let Some(record) = record
     {
-        UNDO.with(|state| {
+        OPERATION.with(|state| {
             if let Some(records) = state.borrow_mut().as_mut() {
                 records.push(record);
             }
@@ -126,6 +140,9 @@ fn start(symbols: Symbols) -> u32 {
         ORIGINAL_DO.store(original as usize, Ordering::Release);
         let original = unsafe { MinHook::create_hook(undo_target, undo as *mut c_void) }?;
         ORIGINAL_UNDO.store(original as usize, Ordering::Release);
+        let redo_target = (shell + symbols.redo_to) as *mut c_void;
+        let original = unsafe { MinHook::create_hook(redo_target, redo as *mut c_void) }?;
+        ORIGINAL_REDO.store(original as usize, Ordering::Release);
         Ok::<_, minhook::MH_STATUS>(())
     })();
     if install.is_err() {
