@@ -30,7 +30,11 @@ fn string(buffer: &[u16]) -> String {
     )
 }
 
-pub fn fetch(dll: &Path, cache: &Path) -> io::Result<PathBuf> {
+pub fn fetch(
+    dll: &Path,
+    cache: &Path,
+    preparation: &mut crate::symbols::Preparation,
+) -> io::Result<PathBuf> {
     let mut info: SYMSRV_INDEX_INFOW = unsafe { std::mem::zeroed() };
     info.sizeofstruct = size_of::<SYMSRV_INDEX_INFOW>() as u32;
     if unsafe { SymSrvGetFileIndexInfoW(wide(&dll.to_string_lossy()).as_ptr(), &mut info, 0) } == 0
@@ -55,6 +59,7 @@ pub fn fetch(dll: &Path, cache: &Path) -> io::Result<PathBuf> {
     if destination.is_file() {
         return Ok(folder);
     }
+    *preparation = crate::symbols::Preparation::Download(name.to_string());
     fs::create_dir_all(&folder)?;
     let partial = destination.with_extension("part");
     let url = format!("https://msdl.microsoft.com/download/symbols/{name}/{key}/{name}");
@@ -70,10 +75,9 @@ pub fn fetch(dll: &Path, cache: &Path) -> io::Result<PathBuf> {
     };
     if status < 0 {
         let _ = fs::remove_file(&partial);
-        return Err(io::Error::other(format!(
-            "Downloading {url}: HRESULT {status:#x}"
-        )));
+        return Err(io::Error::other(format!("HRESULT {status:#010x}")));
     }
     fs::rename(partial, destination)?;
+    *preparation = crate::symbols::Preparation::Resolve;
     Ok(folder)
 }

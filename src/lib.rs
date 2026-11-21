@@ -17,13 +17,10 @@ use std::{
 use minhook::MinHook;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 
-#[link(name = "runtimeobject")]
-unsafe extern "system" {
-    fn RoInitialize(init: u32) -> i32;
-    fn RoUninitialize();
-}
-
-use crate::{abi::Symbols, capture::Functions, notify::Record};
+use crate::{
+    abi::Symbols,
+    capture::{Functions, Record},
+};
 
 type Do = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
 
@@ -190,15 +187,13 @@ fn start(symbols: Symbols) -> u32 {
         return 4;
     }
 
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel::<Record>();
     let notifier = thread::spawn(move || {
-        let initialized = unsafe { RoInitialize(1) } >= 0;
-        for record in receiver {
-            let _ = notify::show(record);
-        }
-        if initialized {
-            unsafe { RoUninitialize() };
-        }
+        notify::with_apartment(|| {
+            for record in receiver {
+                let _ = notify::show(&record.description, &record.lines.join("\n"));
+            }
+        })
     });
     *runtime = Some(Runtime { sender, notifier });
 

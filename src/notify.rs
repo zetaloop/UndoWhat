@@ -4,10 +4,18 @@ use windows::{
     core::HSTRING,
 };
 
-pub struct Record {
-    pub description: String,
-    pub count: usize,
-    pub lines: Vec<String>,
+#[link(name = "runtimeobject")]
+unsafe extern "system" {
+    fn RoInitialize(init: u32) -> i32;
+    fn RoUninitialize();
+}
+
+pub fn with_apartment(f: impl FnOnce()) {
+    let initialized = unsafe { RoInitialize(1) } >= 0;
+    f();
+    if initialized {
+        unsafe { RoUninitialize() };
+    }
 }
 
 fn xml_escape(value: &str) -> String {
@@ -17,12 +25,15 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-pub fn show(record: Record) -> windows::core::Result<()> {
-    let body = record.lines.join("\n");
+pub fn show(title: &str, body: &str) -> windows::core::Result<()> {
+    let body = if body.is_empty() {
+        String::new()
+    } else {
+        format!("<text hint-wrap=\"true\">{}</text>", xml_escape(body))
+    };
     let xml = format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text hint-wrap=\"true\">{}</text></binding></visual></toast>",
-        xml_escape(&record.description),
-        xml_escape(&body),
+        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text>{body}</binding></visual></toast>",
+        xml_escape(title),
     );
     let document = XmlDocument::new()?;
     document.LoadXml(&HSTRING::from(xml))?;

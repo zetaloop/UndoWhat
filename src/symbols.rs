@@ -2,13 +2,9 @@ use crate::{abi::Symbols, download};
 
 use std::{env, ffi::c_void, fs, io, path::PathBuf, ptr};
 
-use windows_sys::Win32::System::{
-    Diagnostics::Debug::{
-        SYMBOL_INFOW, SYMOPT_DEFERRED_LOADS, SYMOPT_FAIL_CRITICAL_ERRORS, SYMOPT_UNDNAME,
-        SymCleanup, SymFromNameW, SymInitializeW, SymLoadModuleExW, SymSetOptions,
-    },
-    LibraryLoader::LoadLibraryW,
-    Threading::GetCurrentProcess,
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    SYMBOL_INFOW, SYMOPT_UNDNAME, SymCleanup, SymFromNameW, SymGetOptions, SymInitializeW,
+    SymLoadModuleExW, SymSetOptions,
 };
 
 const NAMES: [(&str, &str); 9] = [
@@ -47,15 +43,25 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain([0]).collect()
 }
 
-struct Session(*mut c_void);
+struct Session(*mut c_void, u32);
 
 impl Drop for Session {
     fn drop(&mut self) {
-        unsafe { SymCleanup(self.0) };
+        unsafe {
+            SymCleanup(self.0);
+            SymSetOptions(self.1);
+        }
     }
 }
 
-pub fn resolve() -> io::Result<Symbols> {
+pub enum Preparation {
+    Cached,
+    Download(String),
+    Resolve,
+    Activate,
+}
+
+pub fn resolve(preparation: &mut Preparation) -> io::Result<Symbols> {
     let cache = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
@@ -71,76 +77,63 @@ pub fn resolve() -> io::Result<Symbols> {
     } else {
         let mut paths = Vec::new();
         for module in ["Windows.Storage", "shell32"] {
-            let folder = download::fetch(&system.join(format!("{module}.dll")), &cache)?;
+            let folder =
+                download::fetch(&system.join(format!("{module}.dll")), &cache, preparation)?;
             paths.push(folder.to_string_lossy().into_owned());
         }
         paths.join(";")
     };
 
-    unsafe {
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS);
-    }
-    let process = unsafe { GetCurrentProcess() };
-    if unsafe { SymInitializeW(process, wide(&path).as_ptr(), 0) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let _session = Session(process);
-
-    let mut bases = [0u64; 2];
-    for (index, name) in ["Windows.Storage", "shell32"].into_iter().enumerate() {
-        let dll = system.join(format!("{name}.dll"));
-        let dll_wide = wide(&dll.to_string_lossy());
-        let handle = unsafe { LoadLibraryW(dll_wide.as_ptr()) };
-        if handle.is_null() {
-            return Err(io::Error::other(format!(
-                "{}: {}",
-                dll.display(),
-                io::Error::last_os_error()
-            )));
+    let path = wide(&path);
+    let mut resolved = [0usize; NAMES.len()];
+    for module in ["Windows.Storage", "shell32"] {
+        // The two on-disk images have the same preferred base.
+        let mut token = 0u8;
+        let session = (&raw mut token).cast();
+        if unsafe { SymInitializeW(session, path.as_ptr(), 0) } == 0 {
+            return Err(io::Error::last_os_error());
         }
-        let address = unsafe {
+        let options = unsafe { SymGetOptions() };
+        let _session = Session(session, options);
+        unsafe { SymSetOptions(options | SYMOPT_UNDNAME) };
+        let dll = system.join(format!("{module}.dll"));
+        let dll_wide = wide(&dll.to_string_lossy());
+        let base = unsafe {
             SymLoadModuleExW(
-                process,
+                session,
                 ptr::null_mut(),
                 dll_wide.as_ptr(),
-                wide(name).as_ptr(),
-                handle as u64,
+                wide(module).as_ptr(),
+                0,
                 0,
                 ptr::null_mut(),
                 0,
             )
         };
-        if address == 0 {
+        if base == 0 {
             return Err(io::Error::other(format!(
-                "{name}: {}",
+                "{module}: {}",
                 io::Error::last_os_error()
             )));
         }
-        bases[index] = address;
-    }
-
-    let mut resolved = [0usize; NAMES.len()];
-    for (index, (module, name)) in NAMES.into_iter().enumerate() {
-        let mut buffer = [0u64; 256];
-        let info = buffer.as_mut_ptr().cast::<SYMBOL_INFOW>();
-        unsafe {
-            (*info).SizeOfStruct = size_of::<SYMBOL_INFOW>() as u32;
-            (*info).MaxNameLen = 1024;
+        for (index, (_, name)) in NAMES.iter().enumerate().filter(|(_, (m, _))| *m == module) {
+            let mut buffer = [0u64; 256];
+            let info = buffer.as_mut_ptr().cast::<SYMBOL_INFOW>();
+            unsafe {
+                (*info).SizeOfStruct = size_of::<SYMBOL_INFOW>() as u32;
+                (*info).MaxNameLen =
+                    ((size_of_val(&buffer) - size_of::<SYMBOL_INFOW>()) / size_of::<u16>()) as u32;
+            }
+            let qualified = wide(&format!("{module}!{name}"));
+            if unsafe { SymFromNameW(session, qualified.as_ptr(), info) } == 0 {
+                return Err(io::Error::other(format!(
+                    "{module}!{name}: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            let address = unsafe { (*info).Address };
+            resolved[index] = usize::try_from(address - base).unwrap();
         }
-        let qualified = wide(&format!("{module}!{name}"));
-        if unsafe { SymFromNameW(process, qualified.as_ptr(), info) } == 0 {
-            return Err(io::Error::other(format!(
-                "{module}!{name}: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        let base = if module == "shell32" {
-            bases[1]
-        } else {
-            bases[0]
-        };
-        let address = unsafe { (*info).Address };
-        resolved[index] = usize::try_from(address - base).unwrap();
     }
     let [
         file_do,

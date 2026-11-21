@@ -18,7 +18,13 @@ use windows::{
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 
-use crate::{abi::Symbols, notify::Record};
+use crate::abi::Symbols;
+
+pub struct Record {
+    pub description: String,
+    pub count: usize,
+    pub lines: Vec<String>,
+}
 
 type Item = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32;
 type GetOp = unsafe extern "system" fn(*mut c_void, bool, *mut u32) -> i32;
