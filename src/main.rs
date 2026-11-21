@@ -1,3 +1,5 @@
+mod abi;
+mod download;
 mod symbols;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,3 +1,5 @@
+use crate::{abi::Symbols, download};
+
 use std::{env, ffi::c_void, fs, io, path::PathBuf, ptr};
 
 use windows_sys::Win32::System::{
@@ -20,20 +22,6 @@ const NAMES: [(&str, &str); 9] = [
     ("shell32", "CUndoManager::UndoTo"),
     ("shell32", "CUndoManager::RedoTo"),
 ];
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct Symbols {
-    pub file_do: usize,
-    pub root_source: usize,
-    pub root_destination: usize,
-    pub root_op: usize,
-    pub node_count: usize,
-    pub node_child: usize,
-    pub node_item: usize,
-    pub undo_to: usize,
-    pub redo_to: usize,
-}
 
 impl Symbols {
     pub fn entries(&self) -> impl Iterator<Item = (String, usize)> {
@@ -74,14 +62,20 @@ pub fn resolve() -> io::Result<Symbols> {
         .join("UndoWhat")
         .join("symbols");
     fs::create_dir_all(&cache)?;
-    let mut path = env::var("_NT_SYMBOL_PATH").unwrap_or_default();
-    if !path.is_empty() {
-        path.push(';');
-    }
-    path.push_str(&format!(
-        "srv*{}*https://msdl.microsoft.com/download/symbols",
-        cache.display()
-    ));
+    let system = env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Windows"))
+        .join("System32");
+    let path = if let Ok(path) = env::var("_NT_SYMBOL_PATH") {
+        path
+    } else {
+        let mut paths = Vec::new();
+        for module in ["Windows.Storage", "shell32"] {
+            let folder = download::fetch(&system.join(format!("{module}.dll")), &cache)?;
+            paths.push(folder.to_string_lossy().into_owned());
+        }
+        paths.join(";")
+    };
 
     unsafe {
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS);
@@ -91,11 +85,6 @@ pub fn resolve() -> io::Result<Symbols> {
         return Err(io::Error::last_os_error());
     }
     let _session = Session(process);
-
-    let system = env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:/Windows"))
-        .join("System32");
 
     let mut bases = [0u64; 2];
     for (index, name) in ["Windows.Storage", "shell32"].into_iter().enumerate() {
