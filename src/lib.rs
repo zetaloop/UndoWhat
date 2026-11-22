@@ -1,32 +1,24 @@
 mod capture;
 mod download;
 mod notify;
+mod overlay;
 mod symbols;
-mod verifier;
 
 use std::{
     cell::RefCell,
     ffi::c_void,
-    io, mem, ptr,
+    io, mem,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc,
     },
 };
 
 use minhook::MinHook;
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, HMODULE},
-    System::{
-        Diagnostics::Debug::OutputDebugStringW,
-        LibraryLoader::{
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
-            GetModuleHandleExW, GetModuleHandleW, LoadLibraryW,
-        },
-        SystemServices::DLL_PROCESS_ATTACH,
-        Threading::CreateThread,
-    },
+use windows_sys::Win32::System::{
+    Diagnostics::Debug::OutputDebugStringW,
+    LibraryLoader::{GetModuleHandleW, LoadLibraryW},
 };
 
 use crate::{
@@ -34,13 +26,8 @@ use crate::{
     symbols::{Preparation, Symbols},
 };
 
-unsafe extern "system" {
-    fn _DllMainCRTStartup(module: HMODULE, reason: u32, reserved: *mut c_void) -> i32;
-}
-
 type Do = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
 
-static CRT_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static ORIGINAL_DO: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_UNDO: AtomicUsize = AtomicUsize::new(0);
@@ -199,13 +186,7 @@ fn install(symbols: Symbols) -> io::Result<mpsc::Receiver<Record>> {
     Ok(receiver)
 }
 
-unsafe extern "system" fn initialize(module: *mut c_void) -> u32 {
-    if unsafe { _DllMainCRTStartup(module, DLL_PROCESS_ATTACH, ptr::null_mut()) } == 0 {
-        unsafe { OutputDebugStringW(windows_sys::core::w!("UndoWhat: CRT initialization failed")) };
-        return 1;
-    }
-    CRT_INITIALIZED.store(true, Ordering::Release);
-
+fn initialize() {
     notify::with_apartment(|| {
         let mut phase = Preparation::Cached;
         let result = symbols::resolve(&mut phase).and_then(|symbols| {
@@ -237,41 +218,4 @@ unsafe extern "system" fn initialize(module: *mut c_void) -> u32 {
             },
         }
     });
-    0
-}
-
-std::arch::global_asm!(
-    ".text",
-    ".globl DllEntry",
-    "DllEntry:",
-    "jmp {entry}",
-    entry = sym dll_entry,
-);
-
-unsafe extern "system" fn dll_entry(module: HMODULE, reason: u32, reserved: *mut c_void) -> i32 {
-    if reason == verifier::DLL_PROCESS_VERIFIER {
-        return unsafe { verifier::describe(reserved) };
-    }
-    if reason == DLL_PROCESS_ATTACH {
-        // Verifier attaches before Windows initializes the processor feature bitmap.
-        let mut pinned = ptr::null_mut();
-        if unsafe {
-            GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                module.cast(),
-                &mut pinned,
-            )
-        } == 0
-        {
-            return 1;
-        }
-        let worker =
-            unsafe { CreateThread(ptr::null(), 0, Some(initialize), module, 0, ptr::null_mut()) };
-        if !worker.is_null() {
-            unsafe { CloseHandle(worker) };
-        }
-    } else if CRT_INITIALIZED.load(Ordering::Acquire) {
-        return unsafe { _DllMainCRTStartup(module, reason, reserved) };
-    }
-    1
 }

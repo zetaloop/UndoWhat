@@ -119,6 +119,7 @@ version = "0.1.1"
 dependencies = [
  "minhook",
  "windows",
+ "windows-core",
  "windows-sys",
 ]
 
